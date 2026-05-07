@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Analisador H2H Flashscore - Automático via API
+Analisador H2H Flashscore - Automático via API + Supabase
 Uso: python analisador_final.py <id_partida1> <id_partida2> ...
    ou python analisador_final.py arquivo_bruto.txt ...
 """
@@ -15,6 +15,8 @@ from itertools import product
 import requests
 from dotenv import load_dotenv
 from telegram import Bot
+
+import db  # módulo do Supabase
 
 load_dotenv('.env.local')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
@@ -243,10 +245,16 @@ def format_ticket(ticket, index):
 
 async def send_telegram(text):
     bot = Bot(token=TELEGRAM_TOKEN)
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode='Markdown')
+    # Suporte a múltiplos chat IDs separados por vírgula
+    ids = [cid.strip() for cid in TELEGRAM_CHAT_ID.split(',') if cid.strip()]
+    for cid in ids:
+        try:
+            await bot.send_message(chat_id=cid, text=text, parse_mode='Markdown')
+        except Exception as e:
+            print(f"⚠️ Erro ao enviar para {cid}: {e}")
 
 # ------------------------------------------------------------
-# 7. Main
+# 7. Main (com chamadas ao banco)
 # ------------------------------------------------------------
 async def main():
     if len(sys.argv) < 2:
@@ -273,6 +281,13 @@ async def main():
         tables.append(format_match_table(home, away, probs))
         sels = get_selections(probs, home, away)
         all_sels.extend(sels)
+        
+        # ✅ Chamada 1: salvar partida e probabilidades no Supabase
+        try:
+            match_id = db.save_match(home, away, raw)
+            db.save_probabilities(match_id, probs)
+        except Exception as e:
+            print(f"⚠️ Erro ao salvar no banco: {e}")
     
     if not tables:
         print("Nenhum jogo válido.")
@@ -294,6 +309,12 @@ async def main():
     
     if ticket_msg:
         await send_telegram(ticket_msg.strip())
+        
+        # ✅ Chamada 2: salvar os bilhetes gerados
+        try:
+            db.save_tickets(tickets)
+        except Exception as e:
+            print(f"⚠️ Erro ao salvar bilhetes no banco: {e}")
 
 if __name__ == '__main__':
     asyncio.run(main())
