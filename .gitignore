@@ -1,0 +1,18 @@
+cat > .gitignore << EOF
+# Ambiente virtual
+venv/
+
+# Arquivos de configuração com tokens
+.env.local
+
+# Arquivos de dados brutos (opcional – versionar ou não)
+dados_h2h.txt
+*.txt
+
+# Python cache
+__pycache__/
+*.pyc
+
+# VS Code
+.vscode/
+EOF
