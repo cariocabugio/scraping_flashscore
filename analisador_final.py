@@ -24,7 +24,7 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 API_URL = "https://global.flashscore.ninja/401/x/feed/df_hh_1_{match_id}"
 STATS_URL = "https://global.flashscore.ninja/401/x/feed/df_st_1_{match_id}"
 EVENTS_URL = "https://global.flashscore.ninja/401/x/feed/df_ml_1_{match_id}"
-DETAIL_URL = "https://global.flashscore.ninja/401/x/feed/dc_1_{match_id}"  # novo
+DETAIL_URL = "https://global.flashscore.ninja/401/x/feed/dc_1_{match_id}"
 HEADERS = {"X-Fsign": "SW9D1eZo", "User-Agent": "Mozilla/5.0"}
 
 def fetch_feed(url_template, match_id):
@@ -87,12 +87,19 @@ def parse_h2h(text, max_games=19):
                 continue
     return dict(teams)
 
+def parse_live_time(text):
+    """Extrai status e minuto de jogo de um feed de tempo real (ex: dc_1 ou similar)."""
+    if not text:
+        return None, None
+    status_match = re.search(r'DA÷(\d+)', text)
+    minute_match = re.search(r'DB÷(\d+)', text)
+    status = int(status_match.group(1)) if status_match else None
+    minute = int(minute_match.group(1)) if minute_match else None
+    return status, minute
+
 def parse_live_stats(text):
-    """Retorna escanteios apenas se a partida estiver ao vivo (tempo > 0)."""
+    """Retorna escanteios do feed de estatísticas ao vivo (df_st_1)."""
     if not text or 'Escanteios' not in text:
-        return (None, None)
-    time_match = re.search(r'ST÷(\d+)', text)
-    if not time_match or int(time_match.group(1)) == 0:
         return (None, None)
     m = re.search(r'Escanteios¬SH÷(\d+)¬SI÷(\d+)', text)
     return (int(m.group(1)), int(m.group(2))) if m else (None, None)
@@ -135,7 +142,7 @@ def parse_match_detail(raw):
     tv_match = re.search(r'TA÷([^¬]+)', raw)
     if tv_match:
         meta['tv_channels'] = tv_match.group(1).strip()
-    # Available feeds
+    # Available feeds (campo bônus, pode não existir)
     feeds_match = re.search(r'DX÷([^¬]+)', raw)
     if feeds_match:
         meta['available_feeds'] = feeds_match.group(1).strip()
@@ -230,6 +237,8 @@ def generate_top_tickets(all_sels, top_n=3):
             break
     return tickets
 
+
+
 def format_ticket(ticket, index):
     lines = [f"🎫 Bilhete {index+1}"]
     for d,p in ticket['bets']:
@@ -261,42 +270,34 @@ async def main():
         home, away = list(data.keys())[:2]
         print(f"✅ {home} x {away}")
 
-        cached = db.get_match_today(home, away)
-        if cached and cached.get('raw_data'):
-            print("♻️  H2H em cache.")
-            raw = cached['raw_data']
-            data = parse_h2h(raw)
-        else:
-            try: db.save_match(home, away, raw)
-            except Exception as e: print(f"⚠️ {e}")
+        # Cache inteligente: recupera ou cria registro da partida
+        match_entry = db.get_or_create_match(home, away, raw)
+        raw = match_entry.get('raw_data', raw)
+        data = parse_h2h(raw)
 
         mid = extract_match_id(arg)
         home_c = away_c = None
 
-        # 1. Metadados da partida (dc_1)
+        # 1. Metadados da partida (dc_1) – exibição limpa
         if mid:
             detail_raw = fetch_feed(DETAIL_URL, mid)
-            if detail_raw and 'DX÷' in detail_raw:
+            if detail_raw:
                 meta = parse_match_detail(detail_raw)
-                print(f"📋 Árbitro: {meta.get('referee', 'N/A')}")
-                print(f"🏟️  Estádio: {meta.get('stadium', 'N/A')} ({meta.get('capacity', 'N/A')})")
-                print(f"📺 TV: {meta.get('tv_channels', 'N/A')}")
-                if meta.get('available_feeds', '').find('OD') != -1:
+                parts = []
+                if meta.get('referee'): parts.append(f"Árbitro: {meta['referee']}")
+                if meta.get('stadium'): parts.append(f"Estádio: {meta['stadium']}" + (f" ({meta['capacity']})" if meta.get('capacity') else ""))
+                if meta.get('tv_channels'): parts.append(f"TV: {meta['tv_channels']}")
+                if parts:
+                    print("📋 " + " | ".join(parts))
+                if 'available_feeds' in meta and 'OD' in meta['available_feeds']:
                     print("🎲 Feeds de odds disponíveis (OD) – podemos tentar capturar odds mais tarde.")
-                # Salvar metadados
-                match_entry = cached or db.get_match_today(home, away)
-                if not match_entry:
-                    match_entry = {'id': db.save_match(home, away, raw)}
                 db.save_match_metadata(match_entry['id'], meta)
 
-        # 2. Escanteios (eventos ou ao vivo)
+        # 2. Escanteios (eventos ou ao vivo) – parser corrigido
         if mid:
             ev_raw = fetch_feed(EVENTS_URL, mid)
             if ev_raw and 'EC÷' in ev_raw:
                 events = parse_match_events(ev_raw)
-                match_entry = cached or db.get_match_today(home, away)
-                if not match_entry:
-                    match_entry = {'id': db.save_match(home, away, raw)}
                 db.save_match_events(match_entry['id'], events)
                 corners_dict = db.get_corners_for_match(match_entry['id'])
                 home_c = corners_dict['home']
@@ -321,8 +322,7 @@ async def main():
         sels = get_selections(probs, home, away)
         all_sels.extend(sels)
         try:
-            m = cached or db.get_match_today(home, away)
-            if m: db.save_probabilities(m['id'], probs)
+            db.save_probabilities(match_entry['id'], probs)
         except Exception as e: print(f"⚠️ {e}")
 
     if not tables: return

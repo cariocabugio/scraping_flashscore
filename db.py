@@ -31,6 +31,14 @@ def get_match_today(home_team: str, away_team: str):
         return res.data[0]
     return None
 
+def get_or_create_match(home_team: str, away_team: str, raw_data: str = None):
+    """Retorna um registro existente de hoje ou cria um novo e retorna o dict."""
+    match = get_match_today(home_team, away_team)
+    if not match:
+        match_id = save_match(home_team, away_team, raw_data)
+        match = {'id': match_id, 'raw_data': raw_data}
+    return match
+
 def save_probabilities(match_id: int, probs: dict):
     rows = []
     for market in ['home_win', 'draw', 'away_win']:
