@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-Analisador H2H Flashscore - Automático via API + Supabase
-Uso: python analisador_final.py <id_partida1> <id_partida2> ...
-   ou python analisador_final.py arquivo_bruto.txt ...
+Analisador H2H Flashscore - com Escanteios Ao Vivo, Metadados, Cache, Telegram e Supabase
 """
 
 import os
@@ -11,44 +9,33 @@ import re
 import asyncio
 from collections import defaultdict
 from itertools import product
+from functools import reduce
 
 import requests
 from dotenv import load_dotenv
 from telegram import Bot
 
-import db  # módulo do Supabase
+import db
 
 load_dotenv('.env.local')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 API_URL = "https://global.flashscore.ninja/401/x/feed/df_hh_1_{match_id}"
-HEADERS = {
-    "X-Fsign": "SW9D1eZo",
-    "User-Agent": "Mozilla/5.0"
-}
+STATS_URL = "https://global.flashscore.ninja/401/x/feed/df_st_1_{match_id}"
+EVENTS_URL = "https://global.flashscore.ninja/401/x/feed/df_ml_1_{match_id}"
+DETAIL_URL = "https://global.flashscore.ninja/401/x/feed/dc_1_{match_id}"  # novo
+HEADERS = {"X-Fsign": "SW9D1eZo", "User-Agent": "Mozilla/5.0"}
 
-# ------------------------------------------------------------
-# 1. Coleta automática ou arquivo
-# ------------------------------------------------------------
-def fetch_h2h_text(match_id):
-    """Busca o texto bruto H2H da API."""
+def fetch_feed(url_template, match_id):
     try:
-        resp = requests.get(API_URL.format(match_id=match_id), headers=HEADERS, timeout=15)
+        resp = requests.get(url_template.format(match_id=match_id), headers=HEADERS, timeout=15)
         resp.raise_for_status()
         return resp.text
-    except Exception as e:
-        print(f"❌ Erro ao buscar ID {match_id}: {e}")
+    except:
         return None
 
-def load_raw_text(source):
-    """
-    source pode ser:
-    - um ID de partida (ex: SOEkFMVh)
-    - um nome de arquivo .txt com os dados brutos
-    Retorna o texto ou None.
-    """
-    # Se for um arquivo existente, lê
+def load_raw_h2h(source):
     try:
         with open(source, 'r', encoding='utf-8') as f:
             content = f.read()
@@ -56,25 +43,18 @@ def load_raw_text(source):
                 return content
     except FileNotFoundError:
         pass
-    
-    # Se parece um ID (sem extensão, letras maiúsculas/minúsculas), tenta API
     if re.match(r'^[a-zA-Z0-9]{8}$', source):
-        print(f"🔍 Buscando ID {source} pela API...")
-        return fetch_h2h_text(source)
-    
-    # Última tentativa: trata como URL
-    match_id = re.search(r'([a-zA-Z0-9]{8})', source)
-    if match_id:
-        return fetch_h2h_text(match_id.group(1))
-    
-    print(f"⚠️ Não foi possível interpretar: {source}")
-    return None
+        return fetch_feed(API_URL, source)
+    mid = re.search(r'([a-zA-Z0-9]{8})', source)
+    return fetch_feed(API_URL, mid.group(1)) if mid else None
 
-# ------------------------------------------------------------
-# 2. Parser (mantido, extrai 19 jogos)
-# ------------------------------------------------------------
-def parse_h2h(text: str, max_games=19):
-    """Extrai os últimos max_games de cada time."""
+def extract_match_id(source):
+    if re.match(r'^[a-zA-Z0-9]{8}$', source):
+        return source
+    m = re.search(r'([a-zA-Z0-9]{8})', source)
+    return m.group(1) if m else None
+
+def parse_h2h(text, max_games=19):
     flat = text.replace('\n', '')
     team_blocks = re.finditer(r'KB÷Últimos jogos:\s*(.+?)¬~KC÷(.*?)(?=~KB÷|~SA÷|~A1÷|$)', flat)
     teams = defaultdict(list)
@@ -101,220 +81,265 @@ def parse_h2h(text: str, max_games=19):
                 res = d.get('KN', '')
                 gf = hg if is_home else ag
                 ga = ag if is_home else hg
-                teams[team_name].append({
-                    'opponent': opp,
-                    'is_home': is_home,
-                    'goals_for': gf,
-                    'goals_against': ga,
-                    'result': res
-                })
+                teams[team_name].append({'opponent': opp, 'is_home': is_home, 'goals_for': gf, 'goals_against': ga, 'result': res})
                 count += 1
             except:
                 continue
     return dict(teams)
 
-# ------------------------------------------------------------
-# 3. Probabilidades (1X2, Overs, Cantos)
-# ------------------------------------------------------------
-def compute_probs(home_data, away_data, max_games=19):
+def parse_live_stats(text):
+    """Retorna escanteios apenas se a partida estiver ao vivo (tempo > 0)."""
+    if not text or 'Escanteios' not in text:
+        return (None, None)
+    time_match = re.search(r'ST÷(\d+)', text)
+    if not time_match or int(time_match.group(1)) == 0:
+        return (None, None)
+    m = re.search(r'Escanteios¬SH÷(\d+)¬SI÷(\d+)', text)
+    return (int(m.group(1)), int(m.group(2))) if m else (None, None)
+
+def parse_match_events(raw):
+    events = []
+    for m in re.finditer(r'SC÷(\d+)¬EC÷(\d+)¬PS÷(home|away)(?:¬PE÷([^¬]*))?', raw):
+        minute = int(m.group(1))
+        code = int(m.group(2))
+        team = m.group(3)
+        player = m.group(4) if m.group(4) else None
+        type_map = {1: 'goal', 3: 'yellow_card', 7: 'red_card', 11: 'penalty_missed', 12: 'substitution', 20: 'corner'}
+        events.append({
+            'event_type': type_map.get(code, f'unknown_{code}'),
+            'event_code': code, 'minute': minute, 'extra_min': 0,
+            'team': team, 'section': '1st' if minute <= 45 else '2nd',
+            'player': player, 'raw': m.group(0)
+        })
+    return events
+
+def parse_match_detail(raw):
+    """Extrai metadados do feed dc_1."""
+    meta = {}
+    # Árbitro
+    ref_match = re.search(r'MIT÷REF¬MIV÷([^¬]+)', raw)
+    if ref_match:
+        meta['referee'] = ref_match.group(1)
+    # Estádio
+    stadium_match = re.search(r'MIT÷VEN¬MIV÷([^¬]+)', raw)
+    if stadium_match:
+        meta['stadium'] = stadium_match.group(1)
+    # Capacidade
+    cap_match = re.search(r'MIT÷CAP¬MIV÷([^¬]+)', raw)
+    if cap_match:
+        try:
+            meta['capacity'] = int(cap_match.group(1).replace(' ', ''))
+        except:
+            pass
+    # TV
+    tv_match = re.search(r'TA÷([^¬]+)', raw)
+    if tv_match:
+        meta['tv_channels'] = tv_match.group(1).strip()
+    # Available feeds
+    feeds_match = re.search(r'DX÷([^¬]+)', raw)
+    if feeds_match:
+        meta['available_feeds'] = feeds_match.group(1).strip()
+    return meta
+
+def compute_probs(home_data, away_data, live_corners=None, max_games=19):
     h = home_data[-max_games:]
     a = away_data[-max_games:]
-    
-    # 1X2
     home_home = [m for m in h if m['is_home']]
     away_away = [m for m in a if not m['is_home']]
-    
-    def _1x2(home_matches, away_matches):
-        home_win = sum(1 for m in home_matches if m['result'] in ('w','wo')) / len(home_matches) if home_matches else 0.35
-        away_win = sum(1 for m in away_matches if m['result'] in ('w','wo')) / len(away_matches) if away_matches else 0.30
-        draw_h = sum(1 for m in home_matches if m['result'] == 'd') / len(home_matches) if home_matches else 0.25
-        draw_a = sum(1 for m in away_matches if m['result'] == 'd') / len(away_matches) if away_matches else 0.25
-        draw = (draw_h + draw_a) / 2
-        total = home_win + draw + away_win
+
+    def _1x2(hm, am):
+        hw = sum(1 for m in hm if m['result'] in ('w','wo')) / len(hm) if hm else 0.35
+        aw = sum(1 for m in am if m['result'] in ('w','wo')) / len(am) if am else 0.30
+        dh = sum(1 for m in hm if m['result'] == 'd') / len(hm) if hm else 0.25
+        da = sum(1 for m in am if m['result'] == 'd') / len(am) if am else 0.25
+        draw = (dh + da) / 2
+        total = hw + draw + aw
         if total > 0:
-            home_win /= total
-            draw /= total
-            away_win /= total
-        return home_win, draw, away_win
-    
-    home_win, draw, away_win = _1x2(home_home, away_away)
-    
-    # Overs (todos os jogos)
+            hw /= total; draw /= total; aw /= total
+        return hw, draw, aw
+    hw, draw, aw = _1x2(home_home, away_away)
+
     all_goals = [m['goals_for'] + m['goals_against'] for m in h + a]
     total = len(all_goals)
     over_0_5 = sum(g > 0.5 for g in all_goals) / total if total else 0.95
     over_1_5 = sum(g > 1.5 for g in all_goals) / total if total else 0.8
     over_2_5 = sum(g > 2.5 for g in all_goals) / total if total else 0.55
-    
-    # Cantos (modelo fixo)
+
+    if live_corners and live_corners[0] is not None:
+        tc = live_corners[0] + live_corners[1]
+        corners_8_5 = 1.0 if tc > 8.5 else 0.0
+        corners_9_5 = 1.0 if tc > 9.5 else 0.0
+        corners_10_5 = 1.0 if tc > 10.5 else 0.0
+    else:
+        corners_8_5, corners_9_5, corners_10_5 = 0.55, 0.45, 0.35
+
     return {
-        'home_win': home_win,
-        'draw': draw,
-        'away_win': away_win,
-        'over_0_5': over_0_5,
-        'over_1_5': over_1_5,
-        'over_2_5': over_2_5,
-        'corners_8_5': 0.55,
-        'corners_9_5': 0.45,
-        'corners_10_5': 0.35
+        'home_win': hw, 'draw': draw, 'away_win': aw,
+        'over_0_5': over_0_5, 'over_1_5': over_1_5, 'over_2_5': over_2_5,
+        'corners_8_5': corners_8_5, 'corners_9_5': corners_9_5, 'corners_10_5': corners_10_5
     }
 
-# ------------------------------------------------------------
-# 4. Tabela por partida e seleções
-# ------------------------------------------------------------
 def format_match_table(home, away, probs):
-    lines = [f"📊 *{home} x {away}*"]
-    lines.append(f"Vitória {home}: {probs['home_win']*100:.1f}%")
-    lines.append(f"Empate: {probs['draw']*100:.1f}%")
-    lines.append(f"Vitória {away}: {probs['away_win']*100:.1f}%")
-    lines.append(f"Over 0.5: {probs['over_0_5']*100:.1f}%")
-    lines.append(f"Over 1.5: {probs['over_1_5']*100:.1f}%")
-    lines.append(f"Over 2.5: {probs['over_2_5']*100:.1f}%")
-    lines.append(f"Cantos +8.5: {probs['corners_8_5']*100:.1f}%")
-    lines.append(f"Cantos +9.5: {probs['corners_9_5']*100:.1f}%")
-    lines.append(f"Cantos +10.5: {probs['corners_10_5']*100:.1f}%")
-    return "\n".join(lines)
+    return "\n".join([
+        f"📊 *{home} x {away}*",
+        f"Vitória {home}: {probs['home_win']*100:.1f}%",
+        f"Empate: {probs['draw']*100:.1f}%",
+        f"Vitória {away}: {probs['away_win']*100:.1f}%",
+        f"Over 0.5: {probs['over_0_5']*100:.1f}%",
+        f"Over 1.5: {probs['over_1_5']*100:.1f}%",
+        f"Over 2.5: {probs['over_2_5']*100:.1f}%",
+        f"Cantos +8.5: {probs['corners_8_5']*100:.1f}%",
+        f"Cantos +9.5: {probs['corners_9_5']*100:.1f}%",
+        f"Cantos +10.5: {probs['corners_10_5']*100:.1f}%"
+    ])
 
 def get_selections(probs, home, away):
-    match_label = f"{home} x {away}"
-    sels = []
-    sels.append((f"{match_label}: Vitória {home}", probs['home_win']))
-    sels.append((f"{match_label}: Empate", probs['draw']))
-    sels.append((f"{match_label}: Vitória {away}", probs['away_win']))
-    sels.append((f"{match_label}: Over 0.5", probs['over_0_5']))
-    sels.append((f"{match_label}: Over 1.5", probs['over_1_5']))
-    sels.append((f"{match_label}: Over 2.5", probs['over_2_5']))
-    sels.append((f"{match_label}: Cantos +8.5", probs['corners_8_5']))
-    sels.append((f"{match_label}: Cantos +9.5", probs['corners_9_5']))
-    sels.append((f"{match_label}: Cantos +10.5", probs['corners_10_5']))
-    return sels
+    ml = f"{home} x {away}"
+    return [
+        (f"{ml}: Vitória {home}", probs['home_win']),
+        (f"{ml}: Empate", probs['draw']),
+        (f"{ml}: Vitória {away}", probs['away_win']),
+        (f"{ml}: Over 0.5", probs['over_0_5']),
+        (f"{ml}: Over 1.5", probs['over_1_5']),
+        (f"{ml}: Over 2.5", probs['over_2_5']),
+        (f"{ml}: Cantos +8.5", probs['corners_8_5']),
+        (f"{ml}: Cantos +9.5", probs['corners_9_5']),
+        (f"{ml}: Cantos +10.5", probs['corners_10_5']),
+    ]
 
-# ------------------------------------------------------------
-# 5. Geração dos bilhetes (simples ou múltiplos)
-# ------------------------------------------------------------
 def generate_top_tickets(all_sels, top_n=3):
     by_match = defaultdict(list)
     for desc, prob in all_sels:
-        match_key = desc.split(":")[0].strip()
-        by_match[match_key].append((desc, prob))
-    
-    # Ordena seleções de cada partida
-    for match_key in by_match:
-        by_match[match_key].sort(key=lambda x: x[1], reverse=True)
-    
-    match_keys = list(by_match.keys())
-    
-    if len(match_keys) == 1:
-        # Apenas uma partida → 3 apostas simples
-        single = by_match[match_keys[0]][:top_n]
-        tickets = []
-        for i, (desc, prob) in enumerate(single):
-            tickets.append({'bets': [(desc, prob)], 'combined_prob': prob})
-        return tickets
-    
-    # Múltiplas partidas: combinar 1 seleção de cada
-    combos = list(product(*[by_match[k] for k in match_keys]))
-    scored = []
-    for combo in combos:
-        combined = 1.0
-        for _, p in combo:
-            combined *= p
-        scored.append((combo, combined))
+        mk = desc.split(":")[0].strip()
+        by_match[mk].append((desc, prob))
+    for mk in by_match:
+        by_match[mk].sort(key=lambda x: x[1], reverse=True)
+    mks = list(by_match.keys())
+    if len(mks) == 1:
+        return [{'bets': [(d,p)], 'combined_prob': p} for d,p in by_match[mks[0]][:top_n]]
+    combos = list(product(*[by_match[k] for k in mks]))
+    scored = [(c, reduce(lambda x,y: x*y, [p for _,p in c])) for c in combos]
     scored.sort(key=lambda x: x[1], reverse=True)
-    
-    seen = set()
-    tickets = []
-    for combo, prob in scored:
-        ids = tuple(sorted(desc for desc, _ in combo))
+    seen, tickets = set(), []
+    for c, prob in scored:
+        ids = tuple(sorted(d for d,_ in c))
         if ids not in seen:
             seen.add(ids)
-            tickets.append({'bets': list(combo), 'combined_prob': prob})
+            tickets.append({'bets': list(c), 'combined_prob': prob})
         if len(tickets) >= top_n:
             break
     return tickets
 
-# ------------------------------------------------------------
-# 6. Formatação e envio Telegram
-# ------------------------------------------------------------
 def format_ticket(ticket, index):
     lines = [f"🎫 Bilhete {index+1}"]
-    for desc, prob in ticket['bets']:
-        lines.append(f"• {desc} → {prob*100:.1f}%")
+    for d,p in ticket['bets']:
+        lines.append(f"• {d} → {p*100:.1f}%")
     lines.append(f"🔹 Probabilidade combinada: {ticket['combined_prob']*100:.2f}%")
     return "\n".join(lines)
 
 async def send_telegram(text):
+    if not TELEGRAM_CHAT_ID:
+        return
     bot = Bot(token=TELEGRAM_TOKEN)
-    # Suporte a múltiplos chat IDs separados por vírgula
-    ids = [cid.strip() for cid in TELEGRAM_CHAT_ID.split(',') if cid.strip()]
+    ids = [c.strip() for c in TELEGRAM_CHAT_ID.split(',') if c.strip()]
     for cid in ids:
         try:
             await bot.send_message(chat_id=cid, text=text, parse_mode='Markdown')
         except Exception as e:
-            print(f"⚠️ Erro ao enviar para {cid}: {e}")
+            print(f"⚠️ Telegram {cid}: {e}")
 
-# ------------------------------------------------------------
-# 7. Main (com chamadas ao banco)
-# ------------------------------------------------------------
 async def main():
     if len(sys.argv) < 2:
         print("Uso: python analisador_final.py <id_ou_arquivo> ...")
         return
-    
-    all_sels = []
-    tables = []
-    
+    all_sels, tables = [], []
     for arg in sys.argv[1:]:
-        raw = load_raw_text(arg)
-        if not raw:
-            continue
-        
-        data = parse_h2h(raw, max_games=19)
-        if len(data) < 2:
-            print(f"⚠️ {arg}: menos de 2 times encontrados.")
-            continue
-        
+        raw = load_raw_h2h(arg)
+        if not raw: continue
+        data = parse_h2h(raw)
+        if len(data) < 2: continue
         home, away = list(data.keys())[:2]
         print(f"✅ {home} x {away}")
-        
-        probs = compute_probs(data[home], data[away])
+
+        cached = db.get_match_today(home, away)
+        if cached and cached.get('raw_data'):
+            print("♻️  H2H em cache.")
+            raw = cached['raw_data']
+            data = parse_h2h(raw)
+        else:
+            try: db.save_match(home, away, raw)
+            except Exception as e: print(f"⚠️ {e}")
+
+        mid = extract_match_id(arg)
+        home_c = away_c = None
+
+        # 1. Metadados da partida (dc_1)
+        if mid:
+            detail_raw = fetch_feed(DETAIL_URL, mid)
+            if detail_raw and 'DX÷' in detail_raw:
+                meta = parse_match_detail(detail_raw)
+                print(f"📋 Árbitro: {meta.get('referee', 'N/A')}")
+                print(f"🏟️  Estádio: {meta.get('stadium', 'N/A')} ({meta.get('capacity', 'N/A')})")
+                print(f"📺 TV: {meta.get('tv_channels', 'N/A')}")
+                if meta.get('available_feeds', '').find('OD') != -1:
+                    print("🎲 Feeds de odds disponíveis (OD) – podemos tentar capturar odds mais tarde.")
+                # Salvar metadados
+                match_entry = cached or db.get_match_today(home, away)
+                if not match_entry:
+                    match_entry = {'id': db.save_match(home, away, raw)}
+                db.save_match_metadata(match_entry['id'], meta)
+
+        # 2. Escanteios (eventos ou ao vivo)
+        if mid:
+            ev_raw = fetch_feed(EVENTS_URL, mid)
+            if ev_raw and 'EC÷' in ev_raw:
+                events = parse_match_events(ev_raw)
+                match_entry = cached or db.get_match_today(home, away)
+                if not match_entry:
+                    match_entry = {'id': db.save_match(home, away, raw)}
+                db.save_match_events(match_entry['id'], events)
+                corners_dict = db.get_corners_for_match(match_entry['id'])
+                home_c = corners_dict['home']
+                away_c = corners_dict['away']
+                print(f"📡 Escanteios via eventos: {home_c} x {away_c}")
+            else:
+                live_raw = fetch_feed(STATS_URL, mid)
+                if live_raw:
+                    home_c, away_c = parse_live_stats(live_raw)
+                    if home_c is not None:
+                        print(f"📡 Escanteios ao vivo: {home_c} x {away_c}")
+                    else:
+                        print("⚠️ Feed ao vivo sem escanteios.")
+                else:
+                    print("ℹ️  Jogo sem feed ao vivo/eventos. Usando modelo fixo para cantos.")
+        else:
+            print("ℹ️  ID não identificado; modelo fixo para cantos.")
+
+        probs = compute_probs(data[home], data[away],
+                              live_corners=(home_c, away_c) if home_c is not None else None)
         tables.append(format_match_table(home, away, probs))
         sels = get_selections(probs, home, away)
         all_sels.extend(sels)
-        
-        # ✅ Chamada 1: salvar partida e probabilidades no Supabase
         try:
-            match_id = db.save_match(home, away, raw)
-            db.save_probabilities(match_id, probs)
-        except Exception as e:
-            print(f"⚠️ Erro ao salvar no banco: {e}")
-    
-    if not tables:
-        print("Nenhum jogo válido.")
-        return
-    
-    # Exibe tabelas individuais
-    full_output = "\n\n".join(tables)
-    print(full_output)
-    await send_telegram(full_output)
-    
-    # Gera e exibe bilhetes
+            m = cached or db.get_match_today(home, away)
+            if m: db.save_probabilities(m['id'], probs)
+        except Exception as e: print(f"⚠️ {e}")
+
+    if not tables: return
+    full = "\n\n".join(tables)
+    print(full)
+    await send_telegram(full)
+
     tickets = generate_top_tickets(all_sels)
-    ticket_msg = ""
-    for i, ticket in enumerate(tickets):
-        msg = format_ticket(ticket, i)
-        print(msg)
-        print()
-        ticket_msg += msg + "\n\n"
-    
-    if ticket_msg:
-        await send_telegram(ticket_msg.strip())
-        
-        # ✅ Chamada 2: salvar os bilhetes gerados
-        try:
-            db.save_tickets(tickets)
-        except Exception as e:
-            print(f"⚠️ Erro ao salvar bilhetes no banco: {e}")
+    tmsg = ""
+    for i, t in enumerate(tickets):
+        msg = format_ticket(t, i)
+        print(msg); print()
+        tmsg += msg + "\n\n"
+    if tmsg:
+        await send_telegram(tmsg.strip())
+        try: db.save_tickets(tickets)
+        except Exception as e: print(f"⚠️ {e}")
 
 if __name__ == '__main__':
     asyncio.run(main())
