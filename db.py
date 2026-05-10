@@ -103,3 +103,26 @@ def get_match_metadata(match_id: int):
         .limit(1) \
         .execute()
     return res.data[0] if res.data else None
+
+def save_ticket_with_selections(ticket_type: str, estimated_odd: float, selections: list, combined_prob: float):
+    """
+    Insere um bilhete e suas seleções associadas.
+    selections é uma lista de dicts: [{'match_id': id, 'market': 'over_1_5', 'probability': 0.72}, ...]
+    """
+    # Insere o ticket
+    res = supabase.table("tickets").insert({
+        "combined_prob": combined_prob,
+        "selections": selections,   # mantém compatibilidade com o campo JSON existente
+        "ticket_type": ticket_type,
+        "estimated_odd": estimated_odd
+    }).execute()
+    ticket_id = res.data[0]['id']
+
+    # Insere cada seleção na nova tabela
+    for sel in selections:
+        supabase.table("ticket_selections").insert({
+            "ticket_id": ticket_id,
+            "match_id": sel.get('match_id'),
+            "market": sel.get('market'),
+            "probability": sel.get('probability')
+        }).execute()

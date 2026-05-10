@@ -1,193 +1,209 @@
 #!/usr/bin/env python3
 """
-Gerador de Bilhetes da Rodada – Múltiplos Torneios com Filtros Inteligentes.
-
-Uso:
-  python rodada.py <COUNTRY_ID>:<TOURNAMENT_ID> [<COUNTRY_ID>:<TOURNAMENT_ID> ...]
-  python rodada.py <TOURNAMENT_ID>                       # assume país 39 (Brasil)
-
-Exemplos:
-  python rodada.py 39:vRtLP6rs                           # Série B
-  python rodada.py 39:vRtLP6rs 39:lOEwe4o4 81:W6BOzpK2  # Série B + Série A + Bundesliga
+Gerador de Bilhetes Ultra Bingo – 3 bilhetes com partidas únicas.
+Uso: python rodada.py [url:|file:|COUNTRY:TOURNAMENT] ... [--days 0|1|all]
 """
 
-import sys
-import re
-import asyncio
+import sys, re, asyncio
+from datetime import datetime, timedelta, timezone
 from collections import defaultdict
-from itertools import combinations, product
 from functools import reduce
-
 import requests
 from flashscore.fetcher import fetch_feed, load_raw_h2h, HEADERS
 from flashscore.parser import parse_h2h, parse_live_stats
-from flashscore.probabilities import compute_probs, get_selections, format_ticket
+from flashscore.probabilities import compute_probs, get_selections
 from flashscore.telegram_sender import send_telegram
 import db
 
-TOURNAMENT_URL = "https://global.flashscore.ninja/401/x/feed/t_1_{country_id}_{tournament_id}_-3_pt-br_1"
+DEFAULT_COUNTRY = "39"
 STATS_URL = "https://global.flashscore.ninja/401/x/feed/df_st_1_{match_id}"
-DEFAULT_COUNTRY = "39"   # Brasil
-MIN_CONFIDENCE = 0.40    # só inclui seleções com pelo menos 40% de probabilidade
+CONFIDENCE_RANGE = (0.40, 0.85)
+MAX_SELS_PER_MATCH = 6
 
-# ------------------------------------------------------------
-# Funções auxiliares
-# ------------------------------------------------------------
-def fetch_tournament_feed(country_id: str, tournament_id: str) -> str | None:
-    """Busca o feed de torneio e retorna o texto bruto."""
-    url = TOURNAMENT_URL.format(country_id=country_id, tournament_id=tournament_id)
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        return resp.text
-    except Exception as e:
-        print(f"❌ Erro ao buscar feed do torneio {tournament_id}: {e}")
+def extract_upcoming_from_standings(raw, days=1):
+    now = datetime.now(timezone.utc)
+    if days == 'all':
+        return "".join(f"AA÷{mid}¬" for mid in re.findall(r'LMU÷upcoming.*?LME÷(\w{8})', raw))
+    start = (now if days == 0 else now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    start_ts, end_ts = int(start.timestamp()), int(end.timestamp()) - 1
+    ids = [m.group(1) for m in re.finditer(r'LMU÷upcoming.*?LME÷(\w{8})\s*.*?LMC÷(\d{10})', raw, re.DOTALL)
+           if start_ts <= int(m.group(2)) <= end_ts]
+    return "".join(f"AA÷{mid}¬" for mid in ids)
+
+def try_fetch_tournament(source, days=1):
+    if source.startswith("url:"):
+        url = source[4:]
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            if resp.ok and len(resp.text) > 100:
+                return extract_upcoming_from_standings(resp.text, days)
+        except: pass
         return None
+    if source.startswith("file:"):
+        path = source[5:]
+        try:
+            with open(path, encoding='utf-8') as f:
+                return extract_upcoming_from_standings(f.read(), days)
+        except: pass
+        return None
+    country, tour = (source.split(':', 1) if ':' in source else (DEFAULT_COUNTRY, source))
+    for url in (f"https://global.flashscore.ninja/401/x/feed/t_1_{country}_{tour}_-3_pt-br_1",
+                f"https://global.flashscore.ninja/401/x/feed/to_{country}_{tour}_1"):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            if resp.ok and len(resp.text) > 50:
+                return extract_upcoming_from_standings(resp.text, days)
+        except: continue
+    return None
 
-def extract_match_ids(raw: str) -> list[str]:
-    """Extrai os IDs das partidas – campo AA÷ no feed de torneio."""
-    return re.findall(r'AA÷(\w{8})', raw)
+def extract_match_ids(raw):
+    return list(set(re.findall(r'AA÷(\w{8})', raw)))
 
-async def process_match(match_id: str, min_confidence: float = MIN_CONFIDENCE):
-    """Processa uma partida e retorna suas seleções com filtro de confiança."""
+async def process_match(match_id):
     raw = load_raw_h2h(match_id)
-    if not raw:
-        print(f"⚠️ H2H não encontrado para {match_id}")
-        return [], None, None
+    if not raw: return [], None, None
     data = parse_h2h(raw)
-    if len(data) < 2:
-        print(f"⚠️ Menos de 2 times para {match_id}")
-        return [], None, None
+    if len(data) < 2: return [], None, None
     home, away = list(data.keys())[:2]
-    print(f"✅ {home} x {away} ({match_id})")
-
-    # Cache inteligente
+    print(f"✅ {home} x {away}")
     match_entry = db.get_or_create_match(home, away, raw)
     raw = match_entry.get('raw_data', raw)
     data = parse_h2h(raw)
-
-    # Escanteios ao vivo
     home_c = away_c = None
     live_raw = fetch_feed(STATS_URL, match_id)
     if live_raw:
         home_c, away_c = parse_live_stats(live_raw)
-        if home_c is not None:
-            print(f"📡 Escanteios ao vivo: {home_c} x {away_c}")
-
+        if home_c == 0 and away_c == 0:
+            home_c, away_c = None, None
     probs = compute_probs(data[home], data[away],
                           live_corners=(home_c, away_c) if home_c is not None else None)
     all_sels = get_selections(probs, home, away)
+    filtered = [(d,p) for d,p in all_sels if CONFIDENCE_RANGE[0] <= p <= CONFIDENCE_RANGE[1]]
+    if not filtered:
+        filtered = [max(all_sels, key=lambda x: x[1])]
+    try: db.save_probabilities(match_entry['id'], probs)
+    except: pass
+    return filtered, home, away
 
-    # Filtro de confiança mínima
-    filtered_sels = [(desc, prob) for desc, prob in all_sels if prob >= min_confidence]
-    if not filtered_sels:
-        # se nada passou no filtro, usa a melhor seleção
-        best = max(all_sels, key=lambda x: x[1])
-        filtered_sels = [best]
+def market_type(desc):
+    if 'Vitória' in desc or 'Empate' in desc: return '1x2'
+    if 'Over' in desc: return 'over'
+    if 'Cantos' in desc: return 'corners'
+    return 'other'
 
-    # Salva no banco
-    try:
-        db.save_probabilities(match_entry['id'], probs)
-    except Exception as e:
-        print(f"⚠️ {e}")
-
-    return filtered_sels, home, away
-
-# ------------------------------------------------------------
-# Geração de bilhetes múltiplos
-# ------------------------------------------------------------
-def build_multi_tickets(all_sels: list, max_pernas: int = 5, top_n: int = 5):
-    """Combina seleções de diferentes partidas em bilhetes múltiplos."""
+def build_three_tickets(all_sels):
+    """Gera 3 bilhetes únicos (Conservador, Moderado, Turbo) com partidas diferentes."""
     by_match = defaultdict(list)
     for desc, prob in all_sels:
         mk = desc.split(":")[0].strip()
         by_match[mk].append((desc, prob))
-
-    match_keys = list(by_match.keys())
-    if len(match_keys) < 2:
-        return []
-
     for mk in by_match:
         by_match[mk].sort(key=lambda x: x[1], reverse=True)
 
-    all_tickets = []
-    for k in range(2, min(max_pernas + 1, len(match_keys) + 1)):
-        for combo_matches in combinations(match_keys, k):
-            # pega as top 3 seleções de cada partida
-            top_sels = [by_match[m][:3] for m in combo_matches]
-            for sel_combo in product(*top_sels):
-                prob = reduce(lambda x, y: x * y, [s[1] for s in sel_combo])
-                all_tickets.append((sel_combo, prob))
+    match_keys = list(by_match.keys())
+    if len(match_keys) < 2: return []
 
-    all_tickets.sort(key=lambda x: x[1], reverse=True)
-    seen = set()
-    unique = []
-    for combo, prob in all_tickets:
-        ids = tuple(sorted(d for d, _ in combo))
-        if ids not in seen:
-            seen.add(ids)
-            unique.append({'bets': list(combo), 'combined_prob': prob})
-        if len(unique) >= top_n:
-            break
-    return unique
+    profiles = [
+        ("Conservador", 4, {"min_corners": 0, "min_1x2": 0}),
+        ("Moderado", 5, {"min_corners": 2}),
+        ("Turbo", 6, {"min_corners": 2, "min_1x2": 1}),
+    ]
 
-# ------------------------------------------------------------
-# Parse dos argumentos
-# ------------------------------------------------------------
+    tickets = []
+    used = set()
+
+    for name, max_n, constr in profiles:
+        sel = []
+        for mk in match_keys:
+            if mk in used: continue
+            for d, p in by_match[mk][:MAX_SELS_PER_MATCH]:
+                types = [market_type(x) for x,_ in sel] + [market_type(d)]
+                ok = True
+                if types.count('corners') < constr.get('min_corners',0): ok = False
+                if types.count('1x2') < constr.get('min_1x2',0): ok = False
+                if ok:
+                    sel.append((d,p))
+                    used.add(mk)
+                    break
+            if len(sel) >= max_n:
+                break
+
+        # Se não atingiu o mínimo de cantos/1x2, tenta complementar com as partidas já usadas (sacrifício controlado)
+        if constr.get('min_corners',0) > sum(1 for x,_ in sel if 'Cantos' in x):
+            for mk in match_keys:
+                if sum(1 for x,_ in sel if 'Cantos' in x) >= constr['min_corners']: break
+                for d, p in by_match[mk][:MAX_SELS_PER_MATCH]:
+                    if 'Cantos' in d:
+                        sel.append((d,p))
+                        used.add(mk)
+                        break
+        if constr.get('min_1x2',0) > sum(1 for x,_ in sel if 'Vitória' in x or 'Empate' in x):
+            for mk in match_keys:
+                if sum(1 for x,_ in sel if 'Vitória' in x or 'Empate' in x) >= constr['min_1x2']: break
+                for d, p in by_match[mk][:MAX_SELS_PER_MATCH]:
+                    if 'Vitória' in d or 'Empate' in d:
+                        sel.append((d,p))
+                        used.add(mk)
+                        break
+
+        if sel:
+            prob = reduce(lambda x,y: x*y, [p for _,p in sel])
+            tickets.append({'bets': sel, 'combined_prob': prob, 'profile': name})
+        if len(tickets) >= 3: break
+
+    return tickets
+
+def format_ticket(ticket, index):
+    profile = ticket.get('profile', 'Bilhete')
+    lines = [f"🎫 *{profile}* #{index+1}"]
+    for d,p in ticket['bets']:
+        lines.append(f"• {d} → {p*100:.1f}%")
+    lines.append(f"🔹 Probabilidade combinada: {ticket['combined_prob']*100:.2f}%")
+    odd = 1.0 / ticket['combined_prob'] if ticket['combined_prob'] > 0 else 0
+    lines.append(f"💎 Odd justa estimada: {odd:.2f}")
+    return "\n".join(lines)
+
 def parse_args():
-    """Interpreta os argumentos da linha de comando como pares (country_id, tournament_id)."""
-    tournaments = []
-    for arg in sys.argv[1:]:
-        if ':' in arg:
-            country, tour = arg.split(':', 1)
+    sources, days = [], 1
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if a == '--days':
+            i += 1
+            if i < len(sys.argv):
+                days = int(sys.argv[i]) if sys.argv[i].isdigit() else sys.argv[i]
         else:
-            country, tour = DEFAULT_COUNTRY, arg
-        tournaments.append((country, tour))
-    return tournaments
+            sources.append(a)
+        i += 1
+    return sources, days
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
 async def main():
     if len(sys.argv) < 2:
-        print("Uso: python rodada.py <COUNTRY_ID>:<TOURNAMENT_ID> ...")
+        print("Uso: python rodada.py [url:|file:|COUNTRY:TOURNAMENT] ... [--days 0|1|all]")
         return
-
-    tournaments = parse_args()
+    sources, days = parse_args()
     all_sels = []
-
-    for country_id, tour_id in tournaments:
-        print(f"\n🔍 Buscando partidas para torneio {tour_id} (país {country_id})...")
-        raw = fetch_tournament_feed(country_id, tour_id)
-        if not raw:
-            print("❌ Feed do torneio vazio. Pulando...")
-            continue
-
-        matches_ids = extract_match_ids(raw)
-        print(f"📋 {len(matches_ids)} partidas encontradas: {matches_ids}")
-
-        for mid in matches_ids:
+    for src in sources:
+        raw = try_fetch_tournament(src, days)
+        if not raw: continue
+        mids = extract_match_ids(raw)
+        print(f"📋 {len(mids)} partidas de {src}")
+        for mid in mids:
             sels, _, _ = await process_match(mid)
             all_sels.extend(sels)
-
     if not all_sels:
-        print("❌ Nenhuma seleção gerada.")
-        return
-
-    tickets = build_multi_tickets(all_sels, max_pernas=4, top_n=5)
+        print("Nenhuma seleção."); return
+    tickets = build_three_tickets(all_sels)
     if not tickets:
-        # Fallback para bilhetes simples (uma perna)
-        tickets = [{'bets': [(d, p)], 'combined_prob': p} for d, p in all_sels[:5]]
-
-    final_msg = "🎫 **Ultra Bingo da Rodada**\n\n"
+        print("Nenhum bilhete."); return
+    header = "🎰 *ULTRA BINGO DA RODADA*\n\n"
+    final_msg = header
     for i, t in enumerate(tickets):
         msg = format_ticket(t, i)
-        print(msg)
-        print()
+        print(msg); print()
         final_msg += msg + "\n\n"
-
-    if final_msg:
-        await send_telegram(final_msg.strip())
+    await send_telegram(final_msg.strip())
 
 if __name__ == '__main__':
     asyncio.run(main())
