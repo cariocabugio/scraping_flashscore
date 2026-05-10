@@ -1,50 +1,45 @@
 #!/usr/bin/env python3
-"""
-Teste do feed de odds.
-Uso: python test_odds.py <ID_PARTIDA>
-"""
+import sys, requests, re, json
 
-import sys
-import re
-import requests
-
-API_URL = "https://global.flashscore.ninja/401/x/feed/df_od_1_{match_id}_1"
-HEADERS = {
-    "X-Fsign": "SW9D1eZo",
-    "User-Agent": "Mozilla/5.0"
-}
-
-def fetch_odds(match_id):
+def fetch_env_from_url(url):
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        resp = requests.get(API_URL.format(match_id=match_id), headers=HEADERS, timeout=15)
+        resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
-        return resp.text
-    except Exception as e:
-        print(f"❌ Erro ao buscar odds: {e}")
+        match = re.search(r'window\.environment\s*=\s*(\{.*?\});', resp.text, re.DOTALL)
+        if match:
+            return json.loads(match.group(1))
+        print("JSON de ambiente não encontrado.")
         return None
-
-def parse_odds(raw):
-    """Extrai odds do feed bruto e imprime as principais."""
-    # Cada mercado é precedido por um código (ex: TO÷...)
-    # Vamos capturar os mercados comuns: 1X2, Over/Under, Cantos
-    markets = re.findall(r'(?:~)?(TO÷[^¬]+)¬(.+?)(?=~TO÷|~A1÷|$)', raw, re.DOTALL)
-    for header, body in markets:
-        market_name = header.replace('TO÷', '')
-        print(f"\n📊 {market_name}")
-        # Extrai cotações individuais (ex: OC÷bet365:1.85)
-        odds = re.findall(r'OC÷([^:]+):([0-9.]+)', body)
-        for bookmaker, odd in odds[:3]:  # mostra até 3 casas
-            print(f"  {bookmaker}: {odd}")
+    except Exception as e:
+        print(f"Erro: {e}")
+        return None
 
 def main():
     if len(sys.argv) < 2:
-        print("Uso: python test_odds.py <ID_PARTIDA>")
+        print("Uso: python test_odds.py <ID_PARTIDA ou URL_COMPLETA>")
         return
-    mid = sys.argv[1]
-    print(f"🔍 Buscando odds para {mid}...")
-    raw = fetch_odds(mid)
-    if raw:
-        parse_odds(raw)
+    arg = sys.argv[1]
+    if arg.startswith("http"):
+        url = arg
+    else:
+        # Monta a URL completa (isso é um chute, melhor usar a URL real)
+        url = f"https://www.flashscore.com.br/jogo/{arg}/"
+    env = fetch_env_from_url(url)
+    if not env: return
+    odds = env.get("odds")
+    if not odds:
+        print("Campo 'odds' não encontrado.")
+        return
+    # Mostra as odds da bet365 (16) para 1X2
+    try:
+        home = odds["1x2"]["ft"]["16"]["home"]
+        draw = odds["1x2"]["ft"]["16"]["draw"]
+        away = odds["1x2"]["ft"]["16"]["away"]
+        print(f"bet365 1X2: {home} / {draw} / {away}")
+    except KeyError:
+        print("Estrutura diferente. Mostrando chaves disponíveis:")
+        print(json.dumps(odds, indent=2)[:2000])
 
 if __name__ == '__main__':
     main()

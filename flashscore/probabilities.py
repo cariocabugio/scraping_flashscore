@@ -2,6 +2,10 @@ from collections import defaultdict
 from itertools import product
 from functools import reduce
 
+# ------------------------------------------------------------
+# Funções originais (mantidas para compatibilidade com analisador_final.py)
+# ------------------------------------------------------------
+
 def compute_probs(home_data, away_data, live_corners=None, max_games=19):
     h = home_data[-max_games:]
     a = away_data[-max_games:]
@@ -68,6 +72,7 @@ def format_match_table(home, away, probs):
         f"Cantos +10.5: {probs['corners_10_5']*100:.1f}%"
     ])
 
+# ----------- Funções originais de bilhetes (ainda usadas por analisador_final.py) ----------
 def generate_top_tickets(all_sels, top_n=3):
     by_match = defaultdict(list)
     for desc, prob in all_sels:
@@ -92,8 +97,115 @@ def generate_top_tickets(all_sels, top_n=3):
     return tickets
 
 def format_ticket(ticket, index):
+    """Formatação simples (usada por analisador_final.py)."""
     lines = [f"🎫 Bilhete {index+1}"]
     for d,p in ticket['bets']:
         lines.append(f"• {d} → {p*100:.1f}%")
     lines.append(f"🔹 Probabilidade combinada: {ticket['combined_prob']*100:.2f}%")
+    return "\n".join(lines)
+
+# ------------------------------------------------------------
+# NOVAS funções – Ultra Bingo (usadas por rodada.py)
+# ------------------------------------------------------------
+
+def market_type(desc: str) -> str:
+    """Classifica a seleção: '1x2', 'over', 'corners' ou 'other'."""
+    if 'Vitória' in desc or 'Empate' in desc:
+        return '1x2'
+    if 'Over' in desc:
+        return 'over'
+    if 'Cantos' in desc:
+        return 'corners'
+    return 'other'
+
+def build_tickets(all_sels: list,
+                  profiles: list = None,
+                  max_sels_per_match: int = 6,
+                  used_matches: set = None) -> list:
+    """
+    Gera bilhetes usando algoritmo guloso.
+    profiles: lista de (nome, max_pernas, {restrições}).
+    Restrições suportadas: min_corners, min_1x2.
+    Retorna lista de dicts com 'bets', 'combined_prob', 'profile'.
+    """
+    if profiles is None:
+        profiles = [
+            ("Conservador", 4, {"min_corners": 0, "min_1x2": 0}),
+            ("Moderado", 5, {"min_corners": 2}),
+            ("Turbo", 6, {"min_corners": 2, "min_1x2": 1}),
+        ]
+
+    by_match = defaultdict(list)
+    for desc, prob in all_sels:
+        mk = desc.split(":")[0].strip()
+        by_match[mk].append((desc, prob))
+    for mk in by_match:
+        by_match[mk].sort(key=lambda x: x[1], reverse=True)
+
+    match_keys = list(by_match.keys())
+    if len(match_keys) < 2:
+        return []
+
+    if used_matches is None:
+        used_matches = set()
+
+    tickets = []
+
+    for name, max_n, constr in profiles:
+        sel = []
+        for mk in match_keys:
+            if mk in used_matches:
+                continue
+            for d, p in by_match[mk][:max_sels_per_match]:
+                types = [market_type(x) for x,_ in sel] + [market_type(d)]
+                ok = True
+                if types.count('corners') < constr.get('min_corners', 0):
+                    ok = False
+                if types.count('1x2') < constr.get('min_1x2', 0):
+                    ok = False
+                if ok:
+                    sel.append((d, p))
+                    used_matches.add(mk)
+                    break
+            if len(sel) >= max_n:
+                break
+
+        # Se não atingiu mínimos, complementa (mesmo repetindo times)
+        if constr.get('min_corners', 0) > sum(1 for x,_ in sel if 'Cantos' in x):
+            for mk in match_keys:
+                if sum(1 for x,_ in sel if 'Cantos' in x) >= constr['min_corners']:
+                    break
+                for d, p in by_match[mk][:max_sels_per_match]:
+                    if 'Cantos' in d:
+                        sel.append((d, p))
+                        used_matches.add(mk)
+                        break
+        if constr.get('min_1x2', 0) > sum(1 for x,_ in sel if 'Vitória' in x or 'Empate' in x):
+            for mk in match_keys:
+                if sum(1 for x,_ in sel if 'Vitória' in x or 'Empate' in x) >= constr['min_1x2']:
+                    break
+                for d, p in by_match[mk][:max_sels_per_match]:
+                    if 'Vitória' in d or 'Empate' in d:
+                        sel.append((d, p))
+                        used_matches.add(mk)
+                        break
+
+        if sel:
+            prob = reduce(lambda x,y: x*y, [p for _,p in sel])
+            tickets.append({'bets': sel, 'combined_prob': prob, 'profile': name})
+
+        if len(tickets) >= len(profiles):
+            break
+
+    return tickets
+
+def format_ultra_ticket(ticket, index):
+    """Formatação rica (com odd estimada) para o Ultra Bingo."""
+    profile = ticket.get('profile', 'Bilhete')
+    lines = [f"🎫 *{profile}* #{index+1}"]
+    for d,p in ticket['bets']:
+        lines.append(f"• {d} → {p*100:.1f}%")
+    lines.append(f"🔹 Probabilidade combinada: {ticket['combined_prob']*100:.2f}%")
+    odd = 1.0 / ticket['combined_prob'] if ticket['combined_prob'] > 0 else 0
+    lines.append(f"💎 Odd justa estimada: {odd:.2f}")
     return "\n".join(lines)

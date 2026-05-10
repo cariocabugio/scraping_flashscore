@@ -126,3 +126,30 @@ def save_ticket_with_selections(ticket_type: str, estimated_odd: float, selectio
             "market": sel.get('market'),
             "probability": sel.get('probability')
         }).execute()
+
+# Nova função: upsert de match_metadata (evita duplicatas)
+def save_match_metadata(match_id: int, metadata: dict):
+    supabase.table("match_metadata") \
+        .upsert({
+            "match_id": match_id,
+            "referee": metadata.get("referee"),
+            "stadium": metadata.get("stadium"),
+            "capacity": metadata.get("capacity"),
+            "tv_channels": metadata.get("tv_channels"),
+            "available_feeds": metadata.get("available_feeds")
+        }, on_conflict="match_id") \
+        .execute()
+
+# Nova função: salva os feeds disponíveis normalizados
+def save_match_feeds(match_id: int, available_feeds: str):
+    # Evita erro se available_feeds for None ou vazio
+    if not available_feeds:
+        return
+    # Quebra a string "PS,OD,HH" em uma lista
+    feeds = [f.strip() for f in available_feeds.split(',') if f.strip()]
+    rows = [{"match_id": match_id, "feed_code": code} for code in feeds]
+    # Upsert para cada feed
+    for row in rows:
+        supabase.table("match_feeds") \
+            .upsert(row, on_conflict="match_id,feed_code") \
+            .execute()
