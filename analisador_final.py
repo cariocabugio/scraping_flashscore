@@ -5,7 +5,7 @@ from flashscore.fetcher import load_raw_h2h, extract_match_id, fetch_feed
 from flashscore.parser import parse_h2h, parse_live_stats, parse_match_events, parse_match_detail
 from flashscore.probabilities import (
     compute_probs, get_selections, format_match_table,
-    build_tickets, format_ultra_ticket
+    build_tickets, format_ultra_ticket, enrich_selections_with_odds  # ← adicionado
 )
 from flashscore.telegram_sender import send_telegram
 from flashscore.odds_fetcher import fetch_all_bookmakers  # novo
@@ -79,7 +79,7 @@ async def main():
                               live_corners=(home_c, away_c) if home_c is not None else None)
 
         # ---------- Odds Reais ----------
-        real_odds = None
+        odds_dict = None
         try:
             odds_dict = fetch_all_bookmakers(mid) if mid else None
             if odds_dict:
@@ -89,21 +89,19 @@ async def main():
                         parts.append(f"{book}: H={markets.get('home','?')}, D={markets.get('draw','?')}, A={markets.get('away','?')}")
                 if parts:
                     print("📈 Odds reais:", " | ".join(parts))
-                best_home = min((m.get('home', 999) for m in odds_dict.values() if isinstance(m, dict)), default=None)
-                best_draw = min((m.get('draw', 999) for m in odds_dict.values() if isinstance(m, dict)), default=None)
-                best_away = min((m.get('away', 999) for m in odds_dict.values() if isinstance(m, dict)), default=None)
-                real_odds = {'home': best_home, 'draw': best_draw, 'away': best_away}
         except Exception as e:
             print(f"⚠️ Não foi possível obter odds reais: {e}")
 
         tables.append(format_match_table(home, away, probs))
         sels = get_selections(probs, home, away)
-        # Adiciona odds reais se disponíveis
-        if real_odds:
-            sels = [(d, p, real_odds.get(d.split(':')[1].strip().lower(), 0.0)) for d, p in sels]
+
+        # Nova montagem das seleções com odds reais (via enrich_selections_with_odds)
+        if odds_dict:
+            enriched = enrich_selections_with_odds(sels, odds_dict)
         else:
-            sels = [(d, p, 0.0) for d, p in sels]
-        all_sels.extend(sels)
+            enriched = [(d, p, None) for d, p in sels]
+        all_sels.extend(enriched)
+
         try:
             db.save_probabilities(match_entry['id'], probs)
         except Exception as e: print(f"⚠️ {e}")
@@ -113,14 +111,12 @@ async def main():
     print(full)
     await send_telegram(full)
 
-    # Gera bilhetes (usa apenas desc e prob)
-    def adapt(sel_list):
-        return [(d, p) for d, p, _ in sel_list]
-
-    tickets = build_tickets(adapt(all_sels))
+    # Gera bilhetes passando as tuplas completas (desc, prob, odds)
+    tickets = build_tickets(all_sels)
     if not tickets and all_sels:
-        tickets = [{'bets': [(d, p)], 'combined_prob': p, 'profile': 'Simples'}
-                   for d, p, _ in sorted(all_sels, key=lambda x: x[1], reverse=True)[:3]]
+        # fallback: se build_tickets não gerar nada, criamos bilhetes simples
+        tickets = [{'bets': [(d, p, od) if od else (d, p)], 'combined_prob': p, 'profile': 'Simples'}
+                   for d, p, od in sorted(all_sels, key=lambda x: x[1], reverse=True)[:3]]
     tmsg = ""
     for i, t in enumerate(tickets):
         msg = format_ultra_ticket(t, i)

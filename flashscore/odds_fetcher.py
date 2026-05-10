@@ -10,8 +10,6 @@ import requests
 BOOKMAKERS = {
     "bet365": 16,
     "Betano.br": 574,
-    "1xBet": 417,
-    "Superbet.br": 933,
 }
 
 BASE_URL = "https://global.ds.lsapp.eu/odds/pq_graphql"

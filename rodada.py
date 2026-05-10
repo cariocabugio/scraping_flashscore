@@ -12,7 +12,7 @@ from flashscore.fetcher import (
 )
 from flashscore.parser import parse_h2h, parse_live_stats, parse_match_detail
 from flashscore.probabilities import (
-    compute_probs, get_selections, build_tickets, format_ultra_ticket
+    compute_probs, enrich_selections_with_odds, get_selections, build_tickets, format_ultra_ticket
 )
 from flashscore.telegram_sender import send_telegram
 from flashscore.odds_fetcher import fetch_all_bookmakers  # novo
@@ -64,30 +64,17 @@ async def process_match(match_id):
         live_corners=(home_c, away_c) if home_c is not None else None
     )
 
-    # ---------- Odds Reais ----------
+    # Odds reais
     real_odds = None
     try:
-        odds_dict = fetch_all_bookmakers(match_id)
-        if odds_dict:
-            # Constrói uma string amigável: "bet365: H=3.3, D=3.8, A=2.01"
-            parts = []
-            for book, markets in odds_dict.items():
-                if isinstance(markets, dict):
-                    parts.append(f"{book}: H={markets.get('home','?')}, D={markets.get('draw','?')}, A={markets.get('away','?')}")
-                else:
-                    parts.append(f"{book}: {markets}")
-            if parts:
-                print("📈 Odds reais:", " | ".join(parts))
-            # Salva num formato mais simples para usar depois (melhor odd para cada mercado)
-            # Por exemplo, podemos pegar o menor valor para 'home' entre todas as casas
-            best_home = min((m.get('home', 999) for m in odds_dict.values() if isinstance(m, dict)), default=None)
-            best_draw = min((m.get('draw', 999) for m in odds_dict.values() if isinstance(m, dict)), default=None)
-            best_away = min((m.get('away', 999) for m in odds_dict.values() if isinstance(m, dict)), default=None)
-            real_odds = {'home': best_home, 'draw': best_draw, 'away': best_away}
+        real_odds = fetch_all_bookmakers(match_id)
+        if real_odds:
+            print("📈 Odds reais:", ", ".join(
+                f"{k}: H={v['home']}, D={v['draw']}, A={v['away']}" for k, v in real_odds.items()
+            ))
     except Exception as e:
         print(f"⚠️ Não foi possível obter odds reais: {e}")
 
-    # Gera seleções e filtra
     all_sels = get_selections(probs, home, away)
     filtered = [
         (d, p) for d, p in all_sels
@@ -96,20 +83,17 @@ async def process_match(match_id):
     if not filtered:
         filtered = [max(all_sels, key=lambda x: x[1])]
 
-    # Armazena as odds reais junto com a seleção (opcional)
     if real_odds:
-        # Podemos associar a melhor odd a cada seleção baseada no mercado
-        # mas por simplicidade, guardamos o dict inteiro para uso em build_tickets
-        filtered = [(d, p, real_odds.get(d.split(":")[1].strip(), 0.0)) for d, p in filtered]
+        enriched = enrich_selections_with_odds(filtered, real_odds)
     else:
-        filtered = [(d, p, 0.0) for d, p in filtered]
+        enriched = [(d, p, None) for d, p in filtered]
 
     try:
         db.save_probabilities(match_entry['id'], probs)
     except Exception:
         pass
 
-    return filtered, home, away
+    return enriched, home, away
 
 # ------------------------------------------------------------
 def parse_args():
